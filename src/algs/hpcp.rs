@@ -344,4 +344,168 @@ mod tests {
             assert_eq!(r, result[i], "test {}", i);
         }
     }
+
+    #[test]
+    fn hpcp_adjusts_size_to_allowed_values() {
+        // size snaps to the closest allowed value: 12, 24 or 36
+        for (size, expected) in [(5usize, 12usize), (13, 24), (30, 36)] {
+            let mut hpcp = HPCP::new();
+            hpcp.size = size;
+            hpcp.compute();
+
+            let r = hpcp.hpcp_data.expect("hpcp_data computed");
+            assert_eq!(r.len(), expected, "size {}", size);
+            assert!(r.iter().all(|&x| x == 0.0), "empty input gives zeros");
+        }
+    }
+
+    #[test]
+    fn hpcp_ignores_out_of_band_frequencies() {
+        // frequencies outside <min_frequency; max_frequency> do not contribute
+        let mut hpcp = HPCP::new();
+        hpcp.band_split_frequency = 0.0;
+        hpcp.frequencies = vec![20.0, 880.0, 10000.0];
+        hpcp.magnitudes = vec![1.0, 1.0, 1.0];
+        hpcp.compute();
+
+        let r = hpcp.hpcp_data.expect("hpcp_data computed");
+        assert_eq!(r[0], 1.0, "only 880 Hz contributes, at bin 0");
+        assert!(r[1..].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn hpcp_truncates_input_to_shorter_vector() {
+        // extra frequencies beyond the magnitudes length are discarded
+        let mut hpcp = HPCP::new();
+        hpcp.band_split_frequency = 0.0;
+        hpcp.frequencies = vec![440.0, 880.0, 1320.0];
+        hpcp.magnitudes = vec![1.0];
+        hpcp.compute();
+
+        let r = hpcp.hpcp_data.expect("hpcp_data computed");
+        assert_eq!(r[0], 1.0, "only the first peak was used");
+        assert_eq!(r[7], 0.0, "1320 Hz would land at bin 7 if not truncated");
+    }
+
+    #[test]
+    fn hpcp_unnormalized_keeps_raw_contributions() {
+        // without normalization the output holds the raw magnitude squares
+        let mut hpcp = HPCP::new();
+        hpcp.band_split_frequency = 0.0;
+        hpcp.normalized = false;
+        hpcp.frequencies = vec![440.0];
+        hpcp.magnitudes = vec![0.5];
+        hpcp.compute();
+
+        let r = hpcp.hpcp_data.expect("hpcp_data computed");
+        assert_eq!(r[0], 0.25, "0.5 squared");
+        assert!(r[1..].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn hpcp_normalizes_bands_separately() {
+        // with the default band split each band is normalized on its own
+        let mut hpcp = HPCP::new();
+        hpcp.frequencies = vec![440.0, 660.0]; // 440 Hz -> low band, 660 Hz -> high band
+        hpcp.magnitudes = vec![0.5, 1.0];
+        hpcp.compute();
+
+        let r = hpcp.hpcp_data.expect("hpcp_data computed");
+        assert_eq!(r[0], 1.0, "low band peak");
+        assert_eq!(r[7], 1.0, "high band peak");
+        assert!(r[1..7].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn hpcp_weighting_applies_cosine_window() {
+        let mut weighted = HPCP::new();
+        weighted.band_split_frequency = 0.0;
+        weighted.normalized = false;
+        weighted.frequencies = vec![660.0]; // bin_f = 12 * log2(660/440) ~= 7.0196
+        weighted.magnitudes = vec![1.0];
+        weighted.compute();
+
+        let mut unweighted = weighted.clone_fields();
+        unweighted.weighting = false;
+        unweighted.compute();
+
+        let w = weighted.hpcp_data.expect("weighted computed");
+        let u = unweighted.hpcp_data.expect("unweighted computed");
+
+        assert_eq!(u[7], 1.0, "unweighted peak lands in bin 7 exactly");
+        assert!(
+            (w[7] - (std::f64::consts::PI * (12.0 * (660.0f64 / 440.0).log2() - 7.0))
+                .cos()
+                .powi(2))
+            .abs()
+                < 1e-9,
+            "weighted peak is scaled by the squared cosine window"
+        );
+    }
+
+    #[test]
+    fn hpcp_harmonics_increase_fundamental_weight() {
+        // harmonics contribute at the peak bin with weight w^2 each; for
+        // harmonics = 3 the harmonic peaks carry weights 1, 2 and 1, so the
+        // unnormalized contribution grows from 1 to 1 + 4 + 1
+        for (harmonics, expected) in [(0usize, 1.0), (3, 6.0)] {
+            let mut hpcp = HPCP::new();
+            hpcp.band_split_frequency = 0.0;
+            hpcp.normalized = false;
+            hpcp.harmonics = harmonics;
+            hpcp.frequencies = vec![440.0];
+            hpcp.magnitudes = vec![1.0];
+            hpcp.compute();
+
+            let r = hpcp.hpcp_data.expect("hpcp_data computed");
+            assert_eq!(r[0], expected, "harmonics {}", harmonics);
+        }
+    }
+
+    #[test]
+    fn hpcp_nonlinear_post_suppresses_weak_bins() {
+        // nonlinear post-processing squashes values well below the maximum
+        let mut linear = HPCP::new();
+        linear.band_split_frequency = 0.0;
+        linear.frequencies = vec![440.0, 660.0];
+        linear.magnitudes = vec![0.5, 1.0];
+        linear.compute();
+        let l = linear.hpcp_data.clone().expect("linear computed");
+
+        let mut nonlinear = linear.clone_fields();
+        nonlinear.nonlinear_post = true;
+        nonlinear.compute();
+        let n = nonlinear.hpcp_data.expect("nonlinear computed");
+
+        assert_eq!(n[7], 1.0, "maximum bin is preserved");
+        assert!(
+            n[0] < l[0] * 0.1,
+            "weak bin {}: suppressed below 10% of linear {}",
+            n[0],
+            l[0]
+        );
+    }
+
+    impl HPCP {
+        /// copy the fields of this HPCP into a new instance for comparisons
+        fn clone_fields(&self) -> HPCP {
+            HPCP {
+                frequencies: self.frequencies.clone(),
+                magnitudes: self.magnitudes.clone(),
+                hpcp_data: None,
+                size: self.size,
+                sample_rate: self.sample_rate,
+                reference_frequency: self.reference_frequency,
+                band_split_frequency: self.band_split_frequency,
+                max_frequency: self.max_frequency,
+                min_frequency: self.min_frequency,
+                harmonics: self.harmonics,
+                weighting: self.weighting,
+                weighting_window_size: self.weighting_window_size,
+                normalized: self.normalized,
+                nonlinear_post: self.nonlinear_post,
+                harmonic_peaks: Vec::new(),
+            }
+        }
+    }
 }

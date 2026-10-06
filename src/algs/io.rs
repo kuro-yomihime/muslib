@@ -131,3 +131,57 @@ impl Algorithm for MonoWriter {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::algs::Algorithm;
+    use super::{MonoLoader, MonoWriter};
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("muslib_io_test_{}_{name}", std::process::id()))
+    }
+
+    #[test]
+    fn mono_writer_mono_loader_roundtrip() {
+        let path = temp_path("roundtrip");
+        let data: [u16; 5] = [0, 10000, 32767, 50000, 65535];
+
+        let mut writer = MonoWriter::new();
+        writer.sample_rate = 8000;
+        writer.file = path.to_str().unwrap().into();
+        writer.pcm_data = data.into();
+        writer.compute();
+
+        let mut loader = MonoLoader::new();
+        loader.file = path.to_str().unwrap().into();
+        loader.compute();
+
+        assert_eq!(loader.pcm_data.unwrap(), data);
+        assert_eq!(loader.sample_rate, 8000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `Option::unwrap()`")] // no audio in the file
+    fn mono_loader_empty_file_has_no_sample_rate() {
+        let mut writer = MonoWriter::new();
+        writer.sample_rate = 8000;
+        writer.file = temp_path("empty").to_str().unwrap().into();
+        writer.compute();
+
+        let mut loader = MonoLoader::new();
+        loader.file = writer.file.clone();
+        loader.compute();
+
+        let _ = std::fs::remove_file(writer.file);
+    }
+
+    #[test]
+    fn mono_writer_defaults() {
+        let w = MonoWriter::new();
+        assert_eq!(w.sample_rate, 44100);
+        assert!(w.pcm_data.is_empty());
+        assert!(w.file.is_empty());
+    }
+}

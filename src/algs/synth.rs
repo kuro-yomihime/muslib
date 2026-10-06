@@ -454,4 +454,159 @@ mod tests {
 
         assert_eq!(t.u16(), result);
     }
+
+    // -- Synthesizer Algorithm tests -----------------------------------------
+
+    use super::{Algorithm, Synthesizer};
+
+    #[test]
+    fn synthesizer_defaults() {
+        let s = Synthesizer::new();
+        assert_eq!(s.sample_rate, 44100);
+        assert_eq!(s.waveform, "sin");
+        assert!(s.envelope.is_empty());
+        assert_eq!(s.pcm_data, None);
+    }
+
+    #[test]
+    fn synthesizer_empty_input_gives_empty_output() {
+        let mut s = Synthesizer::new();
+        s.compute();
+        assert_eq!(s.pcm_data, Some(Vec::new()));
+    }
+
+    #[test]
+    fn synthesizer_output_length_matches_duration() {
+        // time in seconds is converted to samples with the ceiling function
+        let mut s = Synthesizer::new();
+        s.sample_rate = 1000;
+        s.freq = vec![440.0];
+        s.durations = vec![0.5];
+        s.compute();
+        assert_eq!(s.pcm_data.as_ref().unwrap().len(), 500);
+    }
+
+    #[test]
+    fn synthesizer_truncates_to_shorter_input() {
+        // tones are synthesized up to the shorter of freq/durations
+        let mut s = Synthesizer::new();
+        s.sample_rate = 1000;
+        s.freq = vec![440.0, 880.0];
+        s.durations = vec![0.1];
+        s.compute();
+        assert_eq!(s.pcm_data.as_ref().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn synthesizer_starts_from_silence() {
+        // sine amplitude at sample 0 is 0, so pcm starts at the midpoint
+        let mut s = Synthesizer::new();
+        s.sample_rate = 1000;
+        s.freq = vec![440.0];
+        s.durations = vec![0.01];
+        s.compute();
+        assert_eq!(s.pcm_data.as_ref().unwrap()[0], u16::MAX / 2);
+    }
+
+    #[test]
+    fn synthesizer_zero_frequency_is_silent() {
+        // a 0 Hz sine stays at the pcm midpoint for every sample
+        let mut s = Synthesizer::new();
+        s.sample_rate = 1000;
+        s.freq = vec![0.0];
+        s.durations = vec![0.01];
+        s.compute();
+        assert!(s.pcm_data.unwrap().iter().all(|&x| x == u16::MAX / 2));
+    }
+
+    #[test]
+    fn synthesizer_square_wave_spans_full_scale() {
+        let mut s = Synthesizer::new();
+        s.sample_rate = 1000;
+        s.waveform = "sqr".into();
+        s.freq = vec![440.0];
+        s.durations = vec![0.01];
+        s.compute();
+        let r = s.pcm_data.unwrap();
+        assert!(r.contains(&0), "low half of the square wave");
+        assert!(r.contains(&65534), "high half of the square wave");
+    }
+
+    #[test]
+    fn synthesizer_unknown_waveform_falls_back_to_sin() {
+        let mut fallback = Synthesizer::new();
+        fallback.sample_rate = 1000;
+        fallback.waveform = "triangle".into();
+        fallback.freq = vec![440.0];
+        fallback.durations = vec![0.01];
+        fallback.compute();
+
+        let mut sine = Synthesizer::new();
+        sine.sample_rate = 1000;
+        sine.freq = vec![440.0];
+        sine.durations = vec![0.01];
+        sine.compute();
+
+        assert_eq!(fallback.pcm_data, sine.pcm_data);
+    }
+
+    #[test]
+    fn synthesizer_envelope_of_wrong_length_is_ignored() {
+        // only a 5 parameter [a h d s r] envelope is applied
+        let mut s = Synthesizer::new();
+        s.sample_rate = 1000;
+        s.envelope = vec![1.0, 2.0, 3.0];
+        s.waveform = "sqr".into();
+        s.freq = vec![440.0];
+        s.durations = vec![0.01];
+        s.compute();
+        let r = s.pcm_data.unwrap();
+        assert!(r.contains(&0) && r.contains(&65534), "no envelope applied");
+    }
+
+    #[test]
+    fn synthesizer_envelope_starts_from_silence_and_reaches_full_scale() {
+        // attack of 1 sample: sample 0 is silenced, sample 1 is at full scale
+        let mut s = Synthesizer::new();
+        s.sample_rate = 1000;
+        s.envelope = vec![0.001, 0.0, 0.0, 1.0, 0.001];
+        s.freq = vec![440.0];
+        s.durations = vec![0.01];
+        s.compute();
+        let r = s.pcm_data.unwrap();
+        assert_eq!(r[0], u16::MAX / 2, "attack silences the first sample");
+        assert!(r[1] > 44000, "after attack the tone is near full scale");
+    }
+
+    // -- Generator / Envelope / Wavetable edge tests -------------------------
+
+    #[test]
+    fn generator_time_rounds_up() {
+        let mut g = Generator::new(440.0, Some(1000.0), None);
+        assert_eq!(g.time(0.0), 0);
+        assert_eq!(g.time(0.0005), 1, "half a sample is rounded up");
+
+        g.sample_rate(2000.0);
+        assert_eq!(g.time(0.0005), 1, "sample rate change is honoured");
+    }
+
+    #[test]
+    fn generator_sawtooth_spans_period() {
+        let mut g = Generator::new(1.0, Some(4.0), None);
+        g.w(Waveform::Sawtooth);
+        assert_eq!(g.amplitude(0), -1.0, "sawtooth starts at the minimum");
+        assert_eq!(g.amplitude(2), 0.0, "sawtooth crosses zero mid period");
+        assert_eq!(g.amplitude(4), -1.0, "sawtooth wraps after one period");
+    }
+
+    #[test]
+    #[should_panic(expected = "Call .time() first")]
+    fn wavetable_without_time_panics() {
+        let t = Wavetable {
+            generator: Generator::new(440.0, Some(8000.0), None),
+            envelope: None,
+            samples: None,
+        };
+        t.u16();
+    }
 }

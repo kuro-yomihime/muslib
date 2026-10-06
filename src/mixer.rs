@@ -259,3 +259,131 @@ impl Writer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use hound::{SampleFormat, WavSpec, WavWriter};
+
+    use super::{Loader, Writer};
+
+    /// create a unique temporary path for a test
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("muslib_rs_test_{}_{name}", std::process::id()))
+    }
+
+    fn cleanup(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn writer_loader_roundtrip_u16() {
+        let path = temp_path("roundtrip_u16");
+        let data: [u16; 6] = [0, 16384, 32767, 32768, 49152, 65535];
+
+        Writer::new()
+            .sample_rate(8000)
+            .file(path.clone())
+            .write(&data)
+            .unwrap();
+
+        let mut loader = Loader::<u16>::new();
+        loader.file(path.clone()).load().unwrap();
+
+        assert_eq!(loader.data(), data, "unsigned pcm survives the roundtrip");
+        assert_eq!(loader.sample_rate(), Some(8000));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn loader_reads_signed_samples() {
+        let path = temp_path("signed");
+        let data: [u16; 6] = [0, 16384, 32767, 32768, 49152, 65535];
+
+        Writer::new().file(path.clone()).write(&data).unwrap();
+
+        let mut loader = Loader::<i16>::new();
+        loader.file(path.clone()).load().unwrap();
+
+        let expected: Vec<i16> = data.iter().map(|&v| (v ^ 0x8000) as i16).collect();
+        assert_eq!(loader.data(), expected, "signed conversion is an xor");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn loader_reads_normalized_float_samples() {
+        let path = temp_path("float");
+        let data: [u16; 4] = [0, 16384, 32768, 65535];
+
+        Writer::new().file(path.clone()).write(&data).unwrap();
+
+        let mut loader = Loader::<f32>::new();
+        loader.file(path.clone()).load().unwrap();
+
+        for (loaded, &raw) in loader.data().iter().zip(data.iter()) {
+            let expected = ((raw ^ 0x8000) as i16) as f32 / 32768.0;
+            assert!(
+                (loaded - expected).abs() < 1e-6,
+                "loaded {} expected {}",
+                loaded,
+                expected
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn loader_mixes_down_stereo_to_mono() {
+        let path = temp_path("stereo_mono");
+
+        // build a stereo wav with hound directly: ch0 = [100, 200, -300],
+        // ch1 = [-50, 50, 100]
+        let spec = WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(&path, spec).unwrap();
+        for s in [(100i16, -50i16), (200, 50), (-300, 100)] {
+            writer.write_sample(s.0).unwrap();
+            writer.write_sample(s.1).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut mono = Loader::<i16>::new();
+        mono.file(path.clone()).load().unwrap();
+        assert_eq!(mono.data(), vec![50, 250, -200], "sum of both channels");
+
+        let mut first = Loader::<i16>::new();
+        first.file(path.clone()).channel(0).load().unwrap();
+        assert_eq!(first.data(), vec![100, 200, -300], "channel 0 only");
+
+        let mut second = Loader::<i16>::new();
+        second.file(path.clone()).channel(1).load().unwrap();
+        assert_eq!(second.data(), vec![-50, 50, 100], "channel 1 only");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "Could not open file path")]
+    fn loader_panics_on_missing_file() {
+        let mut loader = Loader::<f32>::new();
+        loader.file(temp_path("does_not_exist")).load().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to create a file")]
+    fn writer_panics_on_unwritable_path() {
+        let mut path = std::env::temp_dir();
+        path.push("muslib_rs_no_such_dir");
+        path.push("out.wav");
+
+        Writer::new().file(path).write(&[0]).unwrap();
+    }
+}
